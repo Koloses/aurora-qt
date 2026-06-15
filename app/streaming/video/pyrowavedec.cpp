@@ -584,8 +584,13 @@ bool PyroWaveVideoDecoder::decodeAndPresent() {
     };
 
     // Planes -> General for the decode (compute writes them).
+    // Copy-initialize to vk::Image (image_allocation has both vk::Image and
+    // VkImage conversion operators; a static_cast/function-style cast is
+    // ambiguous on MSVC, but plain copy-init only matches the direct one).
+    vk::Image imgY = m_ImgY, imgCb = m_ImgCb, imgCr = m_ImgCr;
+    const std::array<vk::Image, 3> planes { imgY, imgCb, imgCr };
     auto planeOld = m_ImagesInitialized ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined;
-    for (vk::Image p : {vk::Image(m_ImgY), vk::Image(m_ImgCb), vk::Image(m_ImgCr)}) {
+    for (vk::Image p : planes) {
         barrier(p, planeOld, vk::ImageLayout::eGeneral,
                 m_ImagesInitialized ? vk::AccessFlagBits::eShaderRead : vk::AccessFlags{},
                 vk::AccessFlagBits::eColorAttachmentWrite | vk::AccessFlagBits::eShaderWrite,
@@ -600,7 +605,7 @@ bool PyroWaveVideoDecoder::decodeAndPresent() {
     }
 
     // Planes: decode-write -> compute-sample.
-    for (vk::Image p : {vk::Image(m_ImgY), vk::Image(m_ImgCb), vk::Image(m_ImgCr)}) {
+    for (vk::Image p : planes) {
         barrier(p, vk::ImageLayout::eGeneral, vk::ImageLayout::eGeneral,
                 vk::AccessFlagBits::eColorAttachmentWrite | vk::AccessFlagBits::eShaderWrite,
                 vk::AccessFlagBits::eShaderRead,
