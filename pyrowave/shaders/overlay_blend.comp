@@ -1,0 +1,32 @@
+#version 450
+//
+// Alpha-blend a small RGBA overlay (the moonlight performance/status overlay,
+// rendered to a texture by OverlayManager) over the decoded RGBA frame, on the
+// GPU. moonlight PyroWave decoder present helper (NOT part of the upstream
+// codec). Pyrowave owns its own swapchain present, so it must composite the
+// overlay itself (the ffmpeg renderers do this in their own present path).
+//
+// Straight-alpha "over": out = mix(dst, src.rgb, src.a).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform texture2D Overlay;
+layout(set = 0, binding = 1) uniform sampler   Samp;       // linear, clamp-to-edge
+layout(set = 0, binding = 2, rgba8) uniform image2D Target; // read + write
+
+layout(push_constant) uniform Push {
+    ivec2 offset;   // top-left of the overlay rect in the target image
+    ivec2 size;     // overlay width/height in pixels
+} pc;
+
+void main() {
+    ivec2 lp = ivec2(gl_GlobalInvocationID.xy);
+    if (lp.x >= pc.size.x || lp.y >= pc.size.y)
+        return;
+
+    ivec2 tp = pc.offset + lp;
+    vec2 uv = (vec2(lp) + 0.5) / vec2(pc.size);
+    vec4 src = textureLod(sampler2D(Overlay, Samp), uv, 0.0);  // straight-alpha RGBA
+    vec4 dst = imageLoad(Target, tp);
+    imageStore(Target, tp, vec4(mix(dst.rgb, src.rgb, src.a), 1.0));
+}
