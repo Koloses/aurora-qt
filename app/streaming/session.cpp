@@ -907,6 +907,11 @@ bool Session::initialize(QQuickWindow* qtWindow)
         // straight to H.264 if the user asked for AV1 and the host doesn't support it.
         m_SupportedVideoFormats.removeByMask(~(VIDEO_FORMAT_MASK_AV1 | VIDEO_FORMAT_MASK_H265));
         break;
+    case StreamingPreferences::VCC_FORCE_PYROWAVE:
+        // Keep H.264 as the fallback for hosts without PyroWave support (or
+        // builds without the PyroWave decoder, which never advertise it).
+        m_SupportedVideoFormats.removeByMask(~(VIDEO_FORMAT_MASK_PYROWAVE | VIDEO_FORMAT_MASK_H264));
+        break;
     }
 
     // NB: Since deprioritization puts codecs in reverse order (at the bottom of the list),

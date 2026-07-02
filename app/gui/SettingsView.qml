@@ -1657,6 +1657,10 @@ Flickable {
                             text: qsTr("AV1 (Experimental)")
                             val: StreamingPreferences.VCC_FORCE_AV1
                         }
+                        ListElement {
+                            text: qsTr("PyroWave (GPU wavelet)")
+                            val: StreamingPreferences.VCC_FORCE_PYROWAVE
+                        }
                     }
                     // ::onActivated must be used, as it only listens for when the index is changed by a human
                     onActivated : {
