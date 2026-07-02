@@ -108,6 +108,11 @@ private:
     // arrive just-in-time for the client display: smoothness with no jitter
     // buffer. Falls back to the FIFO acquire-block signal when unsupported.
     bool m_UsePresentWait = false;
+    bool m_SwapchainStale = false;  // out-of-date/suboptimal seen; recreate before next frame
+    bool m_Chroma444 = false;       // stream uses the PyroWave 4:4:4 profile
+
+    bool createSwapchain();     // (re)creates the swapchain for the existing surface
+    bool recreateSwapchain();   // teardown + createSwapchain, called on resize/out-of-date
     uint64_t m_NextPresentId = 0;   // last ID handed to presentKHR (0 = none)
     std::thread m_PresentWaitThread;
     std::mutex m_PresentWaitMutex;

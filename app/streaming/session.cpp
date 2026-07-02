@@ -306,8 +306,9 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
 
 #ifdef HAVE_PYROWAVE
     // PyroWave is decoded only by its own Vulkan decoder; no other decoder can
-    // handle this format, so this branch is terminal for VIDEO_FORMAT_PYROWAVE.
-    if (videoFormat == VIDEO_FORMAT_PYROWAVE) {
+    // handle this format, so this branch is terminal for the PyroWave profiles
+    // (4:2:0 and 4:4:4).
+    if (videoFormat & VIDEO_FORMAT_MASK_PYROWAVE) {
         chosenDecoder = new PyroWaveVideoDecoder(testOnly);
         if (chosenDecoder->initialize(&params)) {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "PyroWave video decoder chosen");
@@ -769,6 +770,11 @@ bool Session::initialize(QQuickWindow* qtWindow)
     // host supports it. It is removed again here if its decoder can't initialize
     // (e.g. no suitable Vulkan device).
     m_SupportedVideoFormats.prepend(VIDEO_FORMAT_PYROWAVE);
+    if (m_Preferences->enableYUV444) {
+        // Preferred over the 4:2:0 profile during negotiation; stripped again
+        // below with the rest of VIDEO_FORMAT_MASK_YUV444 if the pref is off.
+        m_SupportedVideoFormats.prepend(VIDEO_FORMAT_PYROWAVE_444);
+    }
     if (getDecoderAvailability(testWindow,
                                m_Preferences->videoDecoderSelection,
                                VIDEO_FORMAT_PYROWAVE,

@@ -25,8 +25,10 @@ namespace {
   constexpr int64_t kTargetPresentMarginUs = 5000;
   constexpr int64_t kMaxPhaseErrUs = 15000;
 
-  // Push constants for yuv2rgba.comp: output (decode/surface) resolution + recip.
-  struct ConvPush { int32_t w, h; float inv_w, inv_h; };
+  // Push constants for yuv2rgba.comp: output resolution + recip, source (decode)
+  // resolution, and whether to use the sharper Catmull-Rom luma resampling
+  // (enabled when output resolution != decode resolution).
+  struct ConvPush { int32_t w, h; float inv_w, inv_h; int32_t src_w, src_h; int32_t sharp; };
 
   // Push constants for overlay_blend.comp: overlay rect (top-left + size) in the target.
   struct OverlayPush { int32_t ox, oy, w, h; };
@@ -75,13 +77,14 @@ QSize PyroWaveVideoDecoder::getDecoderMaxResolution() {
 }
 
 bool PyroWaveVideoDecoder::initialize(PDECODER_PARAMETERS params) {
-    if (params->videoFormat != VIDEO_FORMAT_PYROWAVE) {
+    if (!(params->videoFormat & VIDEO_FORMAT_MASK_PYROWAVE)) {
         return false;  // not ours; let chooseDecoder try the next decoder
     }
 
     m_Width = params->width;
     m_Height = params->height;
     m_VideoFormat = params->videoFormat;
+    m_Chroma444 = params->videoFormat == VIDEO_FORMAT_PYROWAVE_444;
     m_Window = params->window;
 
     // Instance extensions SDL needs to present to this window (VK_KHR_surface +
@@ -107,7 +110,8 @@ bool PyroWaveVideoDecoder::initialize(PDECODER_PARAMETERS params) {
         // creation; the compute path is the same route the Adreno/Tegra client uses.
         m_Decoder = std::make_unique<PyroWave::Decoder>(
             m_Ctx->physical_device(), m_Ctx->device(), m_Width, m_Height,
-            PyroWave::ChromaSubsampling::Chroma420, /*fragment_path=*/false);
+            m_Chroma444 ? PyroWave::ChromaSubsampling::Chroma444 : PyroWave::ChromaSubsampling::Chroma420,
+            /*fragment_path=*/false);
         m_Input = std::make_unique<PyroWave::DecoderInput>(*m_Decoder);
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: PyroWave::Decoder + input created");
     } catch (const std::exception &e) {
@@ -142,8 +146,8 @@ bool PyroWaveVideoDecoder::initialize(PDECODER_PARAMETERS params) {
 bool PyroWaveVideoDecoder::initVulkanResources() {
     try {
         auto &device = m_Ctx->device();
-        uint32_t cw = (uint32_t(m_Width) + 1) / 2;
-        uint32_t ch = (uint32_t(m_Height) + 1) / 2;
+        uint32_t cw = m_Chroma444 ? uint32_t(m_Width) : (uint32_t(m_Width) + 1) / 2;
+        uint32_t ch = m_Chroma444 ? uint32_t(m_Height) : (uint32_t(m_Height) + 1) / 2;
 
         m_ImgY = make_plane_image(device, m_Width, m_Height, "pyrowave dec Y");
         m_ImgCb = make_plane_image(device, cw, ch, "pyrowave dec Cb");
@@ -171,7 +175,6 @@ bool PyroWaveVideoDecoder::initVulkanResources() {
 
 bool PyroWaveVideoDecoder::initSwapchain() {
     try {
-        auto &device = m_Ctx->device();
         auto &phys = m_Ctx->physical_device();
 
         // Surface on the SDL window using our own instance.
@@ -186,6 +189,22 @@ bool PyroWaveVideoDecoder::initSwapchain() {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: queue family does not support present");
             return false;
         }
+    } catch (const std::exception &e) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: surface init failed: %s", e.what());
+        return false;
+    }
+
+    return createSwapchain();
+}
+
+// (Re)creates the swapchain and everything derived from it for the existing
+// surface. Called at init and again whenever the surface changes (window
+// resize, out-of-date). The caller must ensure no GPU work is in flight and
+// the present-wait thread is stopped when recreating.
+bool PyroWaveVideoDecoder::createSwapchain() {
+    try {
+        auto &device = m_Ctx->device();
+        auto &phys = m_Ctx->physical_device();
 
         auto caps = phys.getSurfaceCapabilitiesKHR(*m_Surface);
         auto formats = phys.getSurfaceFormatsKHR(*m_Surface);
@@ -247,7 +266,16 @@ bool PyroWaveVideoDecoder::initSwapchain() {
         }
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: swapchain %ux%u present_mode=%d direct_present=%d present_wait=%d",
                     m_SwapExtent.width, m_SwapExtent.height, (int) presentMode, (int) m_DirectPresent, (int) m_UsePresentWait);
-        if (m_UsePresentWait) {
+
+        // Present IDs are per swapchain; reset the wait state and (re)start the
+        // wait thread (stopPresentWaitThread() leaves it joined).
+        {
+            std::lock_guard<std::mutex> lk(m_PresentWaitMutex);
+            m_PresentWaitStop = false;
+            m_PendingPresents.clear();
+        }
+        m_NextPresentId = 0;
+        if (m_UsePresentWait && !m_PresentWaitThread.joinable()) {
             m_PresentWaitThread = std::thread(&PyroWaveVideoDecoder::presentWaitThreadProc, this);
         }
         return true;
@@ -255,6 +283,22 @@ bool PyroWaveVideoDecoder::initSwapchain() {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: swapchain init failed: %s", e.what());
         return false;
     }
+}
+
+bool PyroWaveVideoDecoder::recreateSwapchain() {
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: recreating swapchain (resize/out-of-date)");
+    stopPresentWaitThread();
+    waitPreviousFrame();
+    try {
+        (void) m_Ctx->device().waitIdle();
+    } catch (...) {
+    }
+    m_SwapStorageViews.clear();
+    m_SwapImages.clear();
+    m_Swapchain = nullptr;
+    m_SwapchainStale = false;
+    m_FirstFramePresented = false;  // re-arm the pacing cold start
+    return createSwapchain();
 }
 
 bool PyroWaveVideoDecoder::initConvertPipeline() {
@@ -572,6 +616,13 @@ void PyroWaveVideoDecoder::updateStatsAndOverlay(PDECODE_UNIT du, uint64_t decod
 bool PyroWaveVideoDecoder::decodeAndPresent() {
     auto &device = m_Ctx->device();
 
+    // The previous frame saw out-of-date/suboptimal (window resize etc.):
+    // rebuild the swapchain before decoding into it.
+    if (m_SwapchainStale && !recreateSwapchain()) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: swapchain recreation failed");
+        return false;
+    }
+
     uint32_t idx = 0;
     // Phase-offset pacing (pyrofling-style): the time blocked in acquireNextImage is the
     // display-clock backpressure - how long we waited for the compositor/scanout to free a
@@ -584,10 +635,16 @@ bool PyroWaveVideoDecoder::decodeAndPresent() {
     uint64_t acquireStartUs = LiGetMicroseconds();
     try {
         auto [res, i] = m_Swapchain.acquireNextImage(UINT64_MAX, *m_AcquireSem[m_Parity], nullptr);
-        if (res != vk::Result::eSuccess && res != vk::Result::eSuboptimalKHR) {
+        if (res == vk::Result::eSuboptimalKHR) {
+            // Usable this frame, but rebuild before the next one.
+            m_SwapchainStale = true;
+        } else if (res != vk::Result::eSuccess) {
             return true;  // transient; skip this frame
         }
         idx = i;
+    } catch (const vk::OutOfDateKHRError &) {
+        m_SwapchainStale = true;  // rebuilt at the start of the next frame
+        return true;
     } catch (const vk::SystemError &e) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: acquireNextImage failed: %s", e.what());
         return true;
@@ -667,8 +724,10 @@ bool PyroWaveVideoDecoder::decodeAndPresent() {
 
         m_Cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *m_Pipe);
         m_Cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *m_Pl, 0, *m_Dset, {});
+        const bool scaling = m_SwapExtent.width != uint32_t(m_Width) || m_SwapExtent.height != uint32_t(m_Height);
         ConvPush push {(int32_t) m_SwapExtent.width, (int32_t) m_SwapExtent.height,
-                       1.0f / float(m_SwapExtent.width), 1.0f / float(m_SwapExtent.height)};
+                       1.0f / float(m_SwapExtent.width), 1.0f / float(m_SwapExtent.height),
+                       m_Width, m_Height, scaling ? 1 : 0};
         m_Cmd.pushConstants<ConvPush>(*m_Pl, vk::ShaderStageFlagBits::eCompute, 0, push);
         m_Cmd.dispatch((m_SwapExtent.width + 7) / 8, (m_SwapExtent.height + 7) / 8, 1);
 
@@ -690,9 +749,18 @@ bool PyroWaveVideoDecoder::decodeAndPresent() {
                 {}, vk::AccessFlagBits::eShaderWrite,
                 vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eComputeShader);
 
+        // Repoint the output binding at the offscreen image: a previous
+        // direct-present frame (or a pre-recreation swapchain) may have left it
+        // pointing at a swapchain view that no longer exists.
+        vk::DescriptorImageInfo oi {.imageView = *m_RgbaView, .imageLayout = vk::ImageLayout::eGeneral};
+        vk::WriteDescriptorSet w {.dstSet = *m_Dset, .dstBinding = 4, .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &oi};
+        device.updateDescriptorSets(w, {});
+
         m_Cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *m_Pipe);
         m_Cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *m_Pl, 0, *m_Dset, {});
-        ConvPush push {m_Width, m_Height, 1.0f / float(m_Width), 1.0f / float(m_Height)};
+        ConvPush push {m_Width, m_Height, 1.0f / float(m_Width), 1.0f / float(m_Height),
+                       m_Width, m_Height, 0};
         m_Cmd.pushConstants<ConvPush>(*m_Pl, vk::ShaderStageFlagBits::eCompute, 0, push);
         m_Cmd.dispatch((uint32_t(m_Width) + 7) / 8, (uint32_t(m_Height) + 7) / 8, 1);
 
@@ -756,8 +824,10 @@ bool PyroWaveVideoDecoder::decodeAndPresent() {
             }
             m_PresentWaitCv.notify_one();
         }
-    } catch (const vk::SystemError &) {
-        // out-of-date / suboptimal: ignored in this version (no resize handling yet).
+    } catch (const vk::OutOfDateKHRError &) {
+        m_SwapchainStale = true;  // rebuilt at the start of the next frame
+    } catch (const vk::SystemError &e) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: presentKHR failed: %s", e.what());
     }
 
     // Pipelined: do NOT wait here. The next frame's waitPreviousFrame() waits
