@@ -59,6 +59,7 @@ PyroWaveVideoDecoder::~PyroWaveVideoDecoder() {
         Session::get()->getOverlayManager().setOverlayRenderer(nullptr);
     }
     if (m_Ctx) {
+        try { waitPreviousFrame(); } catch (...) {}
         try { (void) m_Ctx->device().waitIdle(); } catch (...) {}
     }
 }
@@ -151,8 +152,10 @@ bool PyroWaveVideoDecoder::initVulkanResources() {
         m_Cmd = std::move(device.allocateCommandBuffers(vk::CommandBufferAllocateInfo {
             .commandPool = *m_CmdPool, .commandBufferCount = 1})[0]);
         m_Fence = vk::raii::Fence(device, vk::FenceCreateInfo {});
-        m_AcquireSem = vk::raii::Semaphore(device, vk::SemaphoreCreateInfo {});
-        m_PresentSem = vk::raii::Semaphore(device, vk::SemaphoreCreateInfo {});
+        for (int i = 0; i < 2; i++) {
+            m_AcquireSem[i] = vk::raii::Semaphore(device, vk::SemaphoreCreateInfo {});
+            m_PresentSem[i] = vk::raii::Semaphore(device, vk::SemaphoreCreateInfo {});
+        }
         return true;
     } catch (const std::exception &e) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: vk resource init failed: %s", e.what());
@@ -564,7 +567,7 @@ bool PyroWaveVideoDecoder::decodeAndPresent() {
     // base FPS - it only trims overproduction.
     uint64_t acquireStartUs = LiGetMicroseconds();
     try {
-        auto [res, i] = m_Swapchain.acquireNextImage(UINT64_MAX, *m_AcquireSem, nullptr);
+        auto [res, i] = m_Swapchain.acquireNextImage(UINT64_MAX, *m_AcquireSem[m_Parity], nullptr);
         if (res != vk::Result::eSuccess && res != vk::Result::eSuboptimalKHR) {
             return true;  // transient; skip this frame
         }
@@ -708,30 +711,40 @@ bool PyroWaveVideoDecoder::decodeAndPresent() {
     m_Cmd.end();
     device.resetFences(*m_Fence);
     m_Ctx->queue().submit(vk::SubmitInfo {
-        .waitSemaphoreCount = 1, .pWaitSemaphores = &*m_AcquireSem, .pWaitDstStageMask = &waitStage,
+        .waitSemaphoreCount = 1, .pWaitSemaphores = &*m_AcquireSem[m_Parity], .pWaitDstStageMask = &waitStage,
         .commandBufferCount = 1, .pCommandBuffers = &*m_Cmd,
-        .signalSemaphoreCount = 1, .pSignalSemaphores = &*m_PresentSem}, *m_Fence);
+        .signalSemaphoreCount = 1, .pSignalSemaphores = &*m_PresentSem[m_Parity]}, *m_Fence);
 
     vk::SwapchainKHR sc = *m_Swapchain;
     try {
         (void) m_Ctx->queue().presentKHR(vk::PresentInfoKHR {
-            .waitSemaphoreCount = 1, .pWaitSemaphores = &*m_PresentSem,
+            .waitSemaphoreCount = 1, .pWaitSemaphores = &*m_PresentSem[m_Parity],
             .swapchainCount = 1, .pSwapchains = &sc, .pImageIndices = &idx});
     } catch (const vk::SystemError &) {
         // out-of-date / suboptimal: ignored in this version (no resize handling yet).
     }
 
-    // Synchronous: wait this frame's GPU work before returning so the next acquire
-    // and command-buffer reset are safe.
-    if (device.waitForFences(*m_Fence, true, UINT64_MAX) != vk::Result::eSuccess) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: waitForFences failed");
-    }
+    // Pipelined: do NOT wait here. The next frame's waitPreviousFrame() waits
+    // this GPU work, so decode+present overlaps the network receive of the
+    // next frame (mirrors the Android decoder).
+    m_HavePending = true;
+    m_Parity ^= 1;
     return true;
 }
 
 int PyroWaveVideoDecoder::submitDecodeUnit(PDECODE_UNIT du) {
+    // Pipelining: wait for the previous frame's GPU work (which overlapped this
+    // frame's network receive) before clearing/writing the input buffers the
+    // GPU reads from.
+    waitPreviousFrame();
+    m_Input->clear();
+
     // Accumulate the frame's reassembled buffer chain into the decoder input.
+    // Each entry is one RTP payload; the host aligns block packets to payload
+    // boundaries, so resync at each entry (a mid-record state means the
+    // previous payload was lost - partial frames are delivered on loss).
     for (PLENTRY entry = du->bufferList; entry != nullptr; entry = entry->next) {
+        m_Input->resync_at_packet_boundary();
         std::span<const uint8_t> span(reinterpret_cast<const uint8_t *>(entry->data), (size_t) entry->length);
         if (!m_Input->push_data(span)) {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: push_data rejected frame %d", du->frameNumber);
@@ -747,7 +760,8 @@ int PyroWaveVideoDecoder::submitDecodeUnit(PDECODE_UNIT du) {
     uint64_t decodeStartUs = LiGetMicroseconds();
     bool ok = decodeAndPresent();
     uint64_t decodeTimeUs = LiGetMicroseconds() - decodeStartUs;
-    m_Input->clear();  // PyroWave frames are self-contained (intra-only)
+    // NB: no clear() here - the GPU may still be reading the input buffers;
+    // the next submit clears them after waitPreviousFrame().
 
     updateStatsAndOverlay(du, decodeTimeUs, ok);
 

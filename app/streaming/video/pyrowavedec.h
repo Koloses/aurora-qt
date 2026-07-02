@@ -85,8 +85,23 @@ private:
     vk::raii::CommandPool m_CmdPool = nullptr;
     vk::raii::CommandBuffer m_Cmd = nullptr;
     vk::raii::Fence m_Fence = nullptr;
-    vk::raii::Semaphore m_AcquireSem = nullptr;
-    vk::raii::Semaphore m_PresentSem = nullptr;
+    // Ping-pong present sync (parity-indexed) so one frame can be in GPU
+    // flight while the receive thread depacketizes the next. Mirrors the
+    // Android decoder's pipelining.
+    vk::raii::Semaphore m_AcquireSem[2] = {nullptr, nullptr};
+    vk::raii::Semaphore m_PresentSem[2] = {nullptr, nullptr};
+    bool m_HavePending = false;  // a submitted-but-not-yet-waited frame exists
+    uint32_t m_Parity = 0;
+
+    // Wait for the previously submitted frame's GPU work to finish. Must be
+    // called before touching the shared decode resources or the CPU-written
+    // input buffers for the next frame.
+    void waitPreviousFrame() {
+        if (m_HavePending) {
+            (void) m_Ctx->device().waitForFences(*m_Fence, true, UINT64_MAX);
+            m_HavePending = false;
+        }
+    }
 
     // Swapchain presentation on the SDL_WINDOW_VULKAN window.
     vk::raii::SurfaceKHR m_Surface = nullptr;
