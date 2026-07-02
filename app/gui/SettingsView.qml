@@ -1239,6 +1239,40 @@ Flickable {
                 }
 
                 CheckBox {
+                    id: pyrowaveAdaptiveFecCheck
+                    width: parent.width
+                    hoverEnabled: true
+                    text: qsTr("Adaptive FEC (PyroWave)")
+                    font.pointSize: 12
+                    checked: StreamingPreferences.pyrowaveAdaptiveFec
+                    onCheckedChanged: {
+                        StreamingPreferences.pyrowaveAdaptiveFec = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Lets the host raise forward error correction (up to 25%) while packet loss is observed, at the cost of some video bitrate. PyroWave streams only.")
+                }
+
+                CheckBox {
+                    id: pyrowaveAdaptiveBitrateCheck
+                    width: parent.width
+                    hoverEnabled: true
+                    text: qsTr("Adaptive bitrate (PyroWave)")
+                    font.pointSize: 12
+                    checked: StreamingPreferences.pyrowaveAdaptiveBitrate
+                    onCheckedChanged: {
+                        StreamingPreferences.pyrowaveAdaptiveBitrate = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Lets the host temporarily lower the video bitrate (down to 50%) while packet loss is observed, recovering when the connection is clean. PyroWave streams only.")
+                }
+
+                CheckBox {
                     id: configurationWarningsCheck
                     width: parent.width
                     text: qsTr("Show configuration warnings")

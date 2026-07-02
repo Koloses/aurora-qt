@@ -989,6 +989,11 @@ bool Session::initialize(QQuickWindow* qtWindow)
         // Video format is now locked in
         m_StreamConfig.supportedVideoFormats = m_SupportedVideoFormats.front();
 
+        // PyroWave adaptive streaming opt-ins (Sunshine extension; sent as
+        // optional SDP attributes, ignored by hosts without support).
+        m_StreamConfig.pyroWaveAdaptiveFec = m_Preferences->pyrowaveAdaptiveFec ? 1 : 0;
+        m_StreamConfig.pyroWaveAdaptiveBitrate = m_Preferences->pyrowaveAdaptiveBitrate ? 1 : 0;
+
         // Populate decoder-dependent properties.
         // Must be done after validateLaunch() since m_StreamConfig is finalized.
         ret = populateDecoderProperties(testWindow);

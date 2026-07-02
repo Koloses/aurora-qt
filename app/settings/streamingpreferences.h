@@ -133,6 +133,8 @@ public:
     Q_PROPERTY(VideoCodecConfig videoCodecConfig MEMBER videoCodecConfig NOTIFY videoCodecConfigChanged)
     Q_PROPERTY(bool enableHdr MEMBER enableHdr NOTIFY enableHdrChanged)
     Q_PROPERTY(bool enableYUV444 MEMBER enableYUV444 NOTIFY enableYUV444Changed)
+    Q_PROPERTY(bool pyrowaveAdaptiveFec MEMBER pyrowaveAdaptiveFec NOTIFY pyrowaveAdaptiveFecChanged)
+    Q_PROPERTY(bool pyrowaveAdaptiveBitrate MEMBER pyrowaveAdaptiveBitrate NOTIFY pyrowaveAdaptiveBitrateChanged)
     Q_PROPERTY(VideoDecoderSelection videoDecoderSelection MEMBER videoDecoderSelection NOTIFY videoDecoderSelectionChanged)
     Q_PROPERTY(WindowMode windowMode MEMBER windowMode NOTIFY windowModeChanged)
     Q_PROPERTY(WindowMode recommendedFullScreenMode MEMBER recommendedFullScreenMode CONSTANT)
@@ -181,6 +183,10 @@ public:
     VideoCodecConfig videoCodecConfig;
     bool enableHdr;
     bool enableYUV444;
+    // PyroWave adaptive streaming opt-ins (Sunshine extension): let the host
+    // raise FEC / temporarily lower the encode bitrate on observed loss.
+    bool pyrowaveAdaptiveFec;
+    bool pyrowaveAdaptiveBitrate;
     VideoDecoderSelection videoDecoderSelection;
     WindowMode windowMode;
     WindowMode recommendedFullScreenMode;
@@ -206,6 +212,8 @@ signals:
     void videoCodecConfigChanged();
     void enableHdrChanged();
     void enableYUV444Changed();
+    void pyrowaveAdaptiveFecChanged();
+    void pyrowaveAdaptiveBitrateChanged();
     void videoDecoderSelectionChanged();
     void uiDisplayModeChanged();
     void windowModeChanged();
