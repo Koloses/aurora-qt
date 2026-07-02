@@ -963,16 +963,17 @@ int PyroWaveVideoDecoder::submitDecodeUnit(PDECODE_UNIT du) {
     m_Input->clear();
 
     // Accumulate the frame's reassembled buffer chain into the decoder input.
-    // NB: do NOT resync the parser at entry boundaries. Block packets larger
-    // than one RTP payload legitimately SPAN payloads (the host's aligned
-    // packer only keeps records <= the payload size within one payload), so a
-    // mid-record state at an entry boundary is normal, not evidence of loss -
-    // resyncing there dropped every spanning block and misparsed its
-    // continuation, corrupting the picture. After real loss (holes in the
-    // chain) the parser may misparse the remainder of this frame; the damage
-    // is bounded by the deferred block registration and healed by the full
-    // refresh the depacketizer requests on loss.
+    // NB: do NOT resync the parser at arbitrary entry boundaries - block
+    // packets larger than one RTP payload legitimately SPAN payloads, so a
+    // mid-record state there is normal. The depacketizer tags the one entry
+    // that follows a tolerated packet-loss gap as BUFFER_TYPE_GAP; that is
+    // the only place a resync is correct (drop the truncated record and
+    // realign at this entry's first record - the host aligns records to
+    // payload boundaries whenever they fit).
     for (PLENTRY entry = du->bufferList; entry != nullptr; entry = entry->next) {
+        if (entry->bufferType == BUFFER_TYPE_GAP) {
+            m_Input->resync_at_packet_boundary();
+        }
         std::span<const uint8_t> span(reinterpret_cast<const uint8_t *>(entry->data), (size_t) entry->length);
         if (!m_Input->push_data(span)) {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: push_data rejected frame %d", du->frameNumber);
