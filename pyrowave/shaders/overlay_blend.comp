@@ -1,4 +1,9 @@
 #version 450
+// Reading a storage image without a format layout qualifier requires this
+// extension (maps to the StorageImageReadWithoutFormat SPIR-V capability,
+// backed by the shaderStorageImageReadWithoutFormat device feature the
+// context enables). Format-less WRITES are core; only the read needs it.
+#extension GL_EXT_shader_image_load_formatted : require
 //
 // Alpha-blend a small RGBA overlay (the moonlight performance/status overlay,
 // rendered to a texture by OverlayManager) over the decoded RGBA frame, on the
