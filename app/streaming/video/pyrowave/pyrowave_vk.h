@@ -32,6 +32,11 @@ namespace pyrowave_vk {
     bool shader_float16 = false;  ///< Enables the faster *_fp16 shader paths.
     bool timeline_semaphore = false;
     bool ycbcr_conversion = false;
+    // VK_KHR_present_id + VK_KHR_present_wait are enabled (swapchain contexts
+    // only). The decoder uses them to timestamp actual scanout of each frame
+    // from a side thread and phase-lock the host capture clock to the client
+    // display (smoothness without added buffering latency).
+    bool present_wait = false;
     uint32_t compute_queue_family = UINT32_MAX;
   };
 

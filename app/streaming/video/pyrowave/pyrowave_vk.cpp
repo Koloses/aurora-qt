@@ -104,6 +104,7 @@ namespace pyrowave_vk {
         VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
       };
       std::vector<const char *> enabled_exts;
+      bool have_present_id_ext = false, have_present_wait_ext = false;
       {
         auto avail = self->phys_dev.enumerateDeviceExtensionProperties();
         for (auto *w : wanted_exts) {
@@ -117,6 +118,11 @@ namespace pyrowave_vk {
             if (std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0) {
               enabled_exts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME); break;
             }
+          }
+          // Present-wait pair (phase-lock feedback); both or neither.
+          for (auto &e : avail) {
+            if (std::strcmp(e.extensionName, VK_KHR_PRESENT_ID_EXTENSION_NAME) == 0) have_present_id_ext = true;
+            if (std::strcmp(e.extensionName, VK_KHR_PRESENT_WAIT_EXTENSION_NAME) == 0) have_present_wait_ext = true;
           }
         }
       }
@@ -139,6 +145,24 @@ namespace pyrowave_vk {
       self->caps_.timeline_semaphore = qts.timelineSemaphore;
       self->caps_.ycbcr_conversion = q11.samplerYcbcrConversion;
 
+      // Present-wait feature query, gated on the extensions being enumerable
+      // (querying feature structs of unsupported extensions is invalid).
+      vk::PhysicalDevicePresentIdFeaturesKHR qpid {};
+      vk::PhysicalDevicePresentWaitFeaturesKHR qpw {};
+      if (have_present_id_ext && have_present_wait_ext) {
+        auto sup_pw = self->phys_dev.getFeatures2<
+          vk::PhysicalDeviceFeatures2,
+          vk::PhysicalDevicePresentIdFeaturesKHR,
+          vk::PhysicalDevicePresentWaitFeaturesKHR>();
+        qpid.presentId = sup_pw.get<vk::PhysicalDevicePresentIdFeaturesKHR>().presentId;
+        qpw.presentWait = sup_pw.get<vk::PhysicalDevicePresentWaitFeaturesKHR>().presentWait;
+      }
+      self->caps_.present_wait = qpid.presentId && qpw.presentWait;
+      if (self->caps_.present_wait) {
+        enabled_exts.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+        enabled_exts.push_back(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+      }
+
       float prio = 1.0f;
       vk::DeviceQueueCreateInfo queue_info {
         .queueFamilyIndex = cqf, .queueCount = 1, .pQueuePriorities = &prio};
@@ -154,7 +178,9 @@ namespace pyrowave_vk {
         vk::PhysicalDeviceSubgroupSizeControlFeatures,
         vk::PhysicalDeviceShaderFloat16Int8Features,
         vk::PhysicalDeviceTimelineSemaphoreFeatures,
-        vk::PhysicalDeviceSynchronization2Features>
+        vk::PhysicalDeviceSynchronization2Features,
+        vk::PhysicalDevicePresentIdFeaturesKHR,
+        vk::PhysicalDevicePresentWaitFeaturesKHR>
         dev_chain;
 
       auto &dci = dev_chain.get<vk::DeviceCreateInfo>();
@@ -175,6 +201,8 @@ namespace pyrowave_vk {
       dev_chain.get<vk::PhysicalDeviceShaderFloat16Int8Features>().shaderFloat16 = qf16.shaderFloat16;
       dev_chain.get<vk::PhysicalDeviceTimelineSemaphoreFeatures>().timelineSemaphore = qts.timelineSemaphore;
       dev_chain.get<vk::PhysicalDeviceSynchronization2Features>().synchronization2 = qsync.synchronization2;
+      dev_chain.get<vk::PhysicalDevicePresentIdFeaturesKHR>().presentId = qpid.presentId;
+      dev_chain.get<vk::PhysicalDevicePresentWaitFeaturesKHR>().presentWait = qpw.presentWait;
 
       // Link each feature struct based on whether the FEATURE is supported (on
       // 1.2/1.3 devices these are core and not enumerable as extensions, but the
@@ -189,6 +217,10 @@ namespace pyrowave_vk {
         dev_chain.unlink<vk::PhysicalDeviceTimelineSemaphoreFeatures>();
       if (!qsync.synchronization2)
         dev_chain.unlink<vk::PhysicalDeviceSynchronization2Features>();
+      if (!self->caps_.present_wait) {
+        dev_chain.unlink<vk::PhysicalDevicePresentIdFeaturesKHR>();
+        dev_chain.unlink<vk::PhysicalDevicePresentWaitFeaturesKHR>();
+      }
 
       self->dev = vk::raii::Device(self->phys_dev, dev_chain.get<vk::DeviceCreateInfo>());
       self->compute_queue = vk::raii::Queue(self->dev, cqf, 0);
@@ -210,8 +242,8 @@ namespace pyrowave_vk {
       aci.pVulkanFunctions = &vma_fns;
       self->allocator.emplace(aci, /*has_debug_utils=*/false);
 
-      SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: Vulkan context ready (fp16=%d)",
-                  (int) self->caps_.shader_float16);
+      SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: Vulkan context ready (fp16=%d present_wait=%d)",
+                  (int) self->caps_.shader_float16, (int) self->caps_.present_wait);
       return self;
     } catch (const std::exception &e) {
       SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: failed to create Vulkan context: %s", e.what());

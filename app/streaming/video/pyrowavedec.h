@@ -19,7 +19,14 @@
 
 #include <SDL.h>
 #include <array>
+#include <atomic>
+#include <climits>
+#include <condition_variable>
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include <vulkan/vulkan_raii.hpp>
@@ -92,6 +99,25 @@ private:
     vk::raii::Semaphore m_PresentSem[2] = {nullptr, nullptr};
     bool m_HavePending = false;  // a submitted-but-not-yet-waited frame exists
     uint32_t m_Parity = 0;
+
+    // --- Phase-lock feedback via VK_KHR_present_wait -----------------------
+    // A side thread waits on present IDs to timestamp each frame's actual
+    // scanout, measures the submit->scanout margin, and the decoder thread
+    // forwards (margin - target) to the host via LiSendPhaseOffset. The host's
+    // existing pacing controller then shifts its capture phase so frames
+    // arrive just-in-time for the client display: smoothness with no jitter
+    // buffer. Falls back to the FIFO acquire-block signal when unsupported.
+    bool m_UsePresentWait = false;
+    uint64_t m_NextPresentId = 0;   // last ID handed to presentKHR (0 = none)
+    std::thread m_PresentWaitThread;
+    std::mutex m_PresentWaitMutex;
+    std::condition_variable m_PresentWaitCv;
+    std::deque<std::pair<uint64_t, uint64_t>> m_PendingPresents;  // (id, submit time us)
+    bool m_PresentWaitStop = false;
+    std::atomic<int> m_PhaseErrUs {INT_MIN};  // INT_MIN = no fresh measurement
+
+    void presentWaitThreadProc();
+    void stopPresentWaitThread();
 
     // Wait for the previously submitted frame's GPU work to finish. Must be
     // called before touching the shared decode resources or the CPU-written

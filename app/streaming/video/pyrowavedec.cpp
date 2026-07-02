@@ -20,6 +20,11 @@
 #include <vector>
 
 namespace {
+  // Phase-lock target: steer the host so each frame's present is submitted
+  // ~this long before its scanout (GPU convert time + a small guard band).
+  constexpr int64_t kTargetPresentMarginUs = 5000;
+  constexpr int64_t kMaxPhaseErrUs = 15000;
+
   // Push constants for yuv2rgba.comp: output (decode/surface) resolution + recip.
   struct ConvPush { int32_t w, h; float inv_w, inv_h; };
 
@@ -58,6 +63,7 @@ PyroWaveVideoDecoder::~PyroWaveVideoDecoder() {
     if (!m_TestOnly) {
         Session::get()->getOverlayManager().setOverlayRenderer(nullptr);
     }
+    stopPresentWaitThread();
     if (m_Ctx) {
         try { waitPreviousFrame(); } catch (...) {}
         try { (void) m_Ctx->device().waitIdle(); } catch (...) {}
@@ -204,14 +210,21 @@ bool PyroWaveVideoDecoder::initSwapchain() {
         auto pretransform = (caps.supportedTransforms & vk::SurfaceTransformFlagBitsKHR::eIdentity)
             ? vk::SurfaceTransformFlagBitsKHR::eIdentity : caps.currentTransform;
 
-        // Lowest-latency present: prefer IMMEDIATE, then MAILBOX, then FIFO.
+        // Prefer MAILBOX: tear-free, never blocks, and with the host's capture
+        // phase-locked to this display (present-wait feedback below) frames
+        // arrive just-in-time, so it adds no queueing latency in steady state.
+        // PYROWAVE_IMMEDIATE=1 restores the old tearing/lowest-latency order.
         auto presentModes = phys.getSurfacePresentModesKHR(*m_Surface);
         auto hasMode = [&](vk::PresentModeKHR m) {
             return std::find(presentModes.begin(), presentModes.end(), m) != presentModes.end();
         };
+        const bool preferImmediate = SDL_getenv("PYROWAVE_IMMEDIATE") != nullptr;
         vk::PresentModeKHR presentMode = vk::PresentModeKHR::eFifo;
-        if (hasMode(vk::PresentModeKHR::eImmediate)) presentMode = vk::PresentModeKHR::eImmediate;
+        if (preferImmediate && hasMode(vk::PresentModeKHR::eImmediate)) presentMode = vk::PresentModeKHR::eImmediate;
         else if (hasMode(vk::PresentModeKHR::eMailbox)) presentMode = vk::PresentModeKHR::eMailbox;
+        else if (hasMode(vk::PresentModeKHR::eImmediate)) presentMode = vk::PresentModeKHR::eImmediate;
+
+        m_UsePresentWait = m_Ctx->caps().present_wait && SDL_getenv("PYROWAVE_NO_PRESENT_WAIT") == nullptr;
 
         m_Swapchain = vk::raii::SwapchainKHR(device, vk::SwapchainCreateInfoKHR {
             .surface = *m_Surface, .minImageCount = imgCount,
@@ -232,8 +245,11 @@ bool PyroWaveVideoDecoder::initSwapchain() {
                     .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1, .layerCount = 1}}));
             }
         }
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: swapchain %ux%u present_mode=%d direct_present=%d",
-                    m_SwapExtent.width, m_SwapExtent.height, (int) presentMode, (int) m_DirectPresent);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: swapchain %ux%u present_mode=%d direct_present=%d present_wait=%d",
+                    m_SwapExtent.width, m_SwapExtent.height, (int) presentMode, (int) m_DirectPresent, (int) m_UsePresentWait);
+        if (m_UsePresentWait) {
+            m_PresentWaitThread = std::thread(&PyroWaveVideoDecoder::presentWaitThreadProc, this);
+        }
         return true;
     } catch (const std::exception &e) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: swapchain init failed: %s", e.what());
@@ -579,7 +595,9 @@ bool PyroWaveVideoDecoder::decodeAndPresent() {
     if (!m_FirstFramePresented) {
         // Skip the cold-start acquire (no steady state yet); arm for subsequent frames.
         m_FirstFramePresented = true;
-    } else {
+    } else if (!m_UsePresentWait) {
+        // Fallback signal (meaningful under FIFO only): time blocked in acquire.
+        // With present-wait the scanout-margin measurement replaces this.
         int64_t blockUs = (int64_t) (LiGetMicroseconds() - acquireStartUs);
         if (blockUs < 0) blockUs = 0;
         if (blockUs > 50000) blockUs = 50000;  // clamp pathological stalls (~50 ms)
@@ -716,10 +734,28 @@ bool PyroWaveVideoDecoder::decodeAndPresent() {
         .signalSemaphoreCount = 1, .pSignalSemaphores = &*m_PresentSem[m_Parity]}, *m_Fence);
 
     vk::SwapchainKHR sc = *m_Swapchain;
+    uint64_t presentId = 0;
+    vk::PresentIdKHR presentIdInfo {};
+    vk::PresentInfoKHR presentInfo {
+        .waitSemaphoreCount = 1, .pWaitSemaphores = &*m_PresentSem[m_Parity],
+        .swapchainCount = 1, .pSwapchains = &sc, .pImageIndices = &idx};
+    if (m_UsePresentWait) {
+        presentId = ++m_NextPresentId;
+        presentIdInfo.swapchainCount = 1;
+        presentIdInfo.pPresentIds = &presentId;
+        presentInfo.pNext = &presentIdInfo;
+    }
     try {
-        (void) m_Ctx->queue().presentKHR(vk::PresentInfoKHR {
-            .waitSemaphoreCount = 1, .pWaitSemaphores = &*m_PresentSem[m_Parity],
-            .swapchainCount = 1, .pSwapchains = &sc, .pImageIndices = &idx});
+        (void) m_Ctx->queue().presentKHR(presentInfo);
+        if (m_UsePresentWait) {
+            std::lock_guard<std::mutex> lk(m_PresentWaitMutex);
+            m_PendingPresents.emplace_back(presentId, LiGetMicroseconds());
+            // Bound the backlog if the wait thread ever stalls (driver quirk).
+            while (m_PendingPresents.size() > 8) {
+                m_PendingPresents.pop_front();
+            }
+            m_PresentWaitCv.notify_one();
+        }
     } catch (const vk::SystemError &) {
         // out-of-date / suboptimal: ignored in this version (no resize handling yet).
     }
@@ -730,6 +766,65 @@ bool PyroWaveVideoDecoder::decodeAndPresent() {
     m_HavePending = true;
     m_Parity ^= 1;
     return true;
+}
+
+// Side thread: waits on each present ID (VK_KHR_present_wait) to learn when
+// the frame actually reached scanout, and converts the submit->scanout margin
+// into a phase error for the host's capture-pacing controller. Positive error
+// (frame ready earlier than the target guard band) => host should capture
+// later; negative => earlier. The decoder thread picks the value up and sends
+// it with the next frame.
+void PyroWaveVideoDecoder::presentWaitThreadProc() {
+    for (;;) {
+        uint64_t id, submitUs;
+        {
+            std::unique_lock<std::mutex> lk(m_PresentWaitMutex);
+            m_PresentWaitCv.wait(lk, [&] { return m_PresentWaitStop || !m_PendingPresents.empty(); });
+            if (m_PresentWaitStop) {
+                return;
+            }
+            id = m_PendingPresents.front().first;
+            submitUs = m_PendingPresents.front().second;
+            m_PendingPresents.pop_front();
+        }
+
+        // Wait in slices so teardown can join promptly.
+        for (;;) {
+            vk::Result res;
+            try {
+                res = m_Swapchain.waitForPresent(id, 100'000'000ull /* 100 ms */);
+            } catch (const vk::SystemError &e) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: waitForPresent failed (%s); disabling phase feedback", e.what());
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lk(m_PresentWaitMutex);
+                if (m_PresentWaitStop) {
+                    return;
+                }
+            }
+            if (res != vk::Result::eTimeout) {
+                break;
+            }
+        }
+
+        int64_t marginUs = (int64_t) (LiGetMicroseconds() - submitUs);
+        int64_t err = marginUs - kTargetPresentMarginUs;
+        if (err > kMaxPhaseErrUs) err = kMaxPhaseErrUs;
+        if (err < -kMaxPhaseErrUs) err = -kMaxPhaseErrUs;
+        m_PhaseErrUs.store((int) err, std::memory_order_relaxed);
+    }
+}
+
+void PyroWaveVideoDecoder::stopPresentWaitThread() {
+    {
+        std::lock_guard<std::mutex> lk(m_PresentWaitMutex);
+        m_PresentWaitStop = true;
+    }
+    m_PresentWaitCv.notify_all();
+    if (m_PresentWaitThread.joinable()) {
+        m_PresentWaitThread.join();
+    }
 }
 
 int PyroWaveVideoDecoder::submitDecodeUnit(PDECODE_UNIT du) {
@@ -762,6 +857,16 @@ int PyroWaveVideoDecoder::submitDecodeUnit(PDECODE_UNIT du) {
     uint64_t decodeTimeUs = LiGetMicroseconds() - decodeStartUs;
     // NB: no clear() here - the GPU may still be reading the input buffers;
     // the next submit clears them after waitPreviousFrame().
+
+    // Phase-lock feedback: forward the latest scanout-margin error measured by
+    // the present-wait thread. Sent from this thread because the control
+    // stream is not safe to use from arbitrary threads.
+    if (m_UsePresentWait) {
+        int err = m_PhaseErrUs.exchange(INT_MIN, std::memory_order_relaxed);
+        if (err != INT_MIN) {
+            LiSendPhaseOffset(err);
+        }
+    }
 
     updateStatsAndOverlay(du, decodeTimeUs, ok);
 
