@@ -43,7 +43,10 @@ public:
     virtual bool initialize(PDECODER_PARAMETERS params) override;
     virtual bool isHardwareAccelerated() override { return true; }
     virtual bool isAlwaysFullScreen() override { return false; }
-    virtual bool isHdrSupported() override { return false; }
+    // HDR10 is supported when the surface offers an ST 2084 colorspace;
+    // initialize() verifies that per stream and rejects the HDR profile
+    // otherwise (so the session falls back to SDR PyroWave).
+    virtual bool isHdrSupported() override { return true; }
     virtual int getDecoderCapabilities() override { return 0; }
     virtual int getDecoderColorspace() override { return COLORSPACE_REC_709; }
     virtual int getDecoderColorRange() override { return COLOR_RANGE_LIMITED; }
@@ -110,6 +113,7 @@ private:
     bool m_UsePresentWait = false;
     bool m_SwapchainStale = false;  // out-of-date/suboptimal seen; recreate before next frame
     bool m_Chroma444 = false;       // stream uses the PyroWave 4:4:4 profile
+    bool m_Hdr = false;             // stream uses a PyroWave HDR10 profile (10-bit BT.2020 + PQ)
 
     bool createSwapchain();     // (re)creates the swapchain for the existing surface
     bool recreateSwapchain();   // teardown + createSwapchain, called on resize/out-of-date

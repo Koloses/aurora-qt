@@ -12,7 +12,9 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) uniform texture2D Overlay;
 layout(set = 0, binding = 1) uniform sampler   Samp;       // linear, clamp-to-edge
-layout(set = 0, binding = 2, rgba8) uniform image2D Target; // read + write
+// Format-less (read+write without format): the target is RGBA8 for SDR or
+// RGBA16F for HDR output.
+layout(set = 0, binding = 2) uniform image2D Target; // read + write
 
 layout(push_constant) uniform Push {
     ivec2 offset;   // top-left of the overlay rect in the target image

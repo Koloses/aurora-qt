@@ -28,15 +28,16 @@ namespace {
   // Push constants for yuv2rgba.comp: output resolution + recip, source (decode)
   // resolution, and whether to use the sharper Catmull-Rom luma resampling
   // (enabled when output resolution != decode resolution).
-  struct ConvPush { int32_t w, h; float inv_w, inv_h; int32_t src_w, src_h; int32_t sharp; };
+  struct ConvPush { int32_t w, h; float inv_w, inv_h; int32_t src_w, src_h; int32_t sharp; int32_t hdr; };
 
   // Push constants for overlay_blend.comp: overlay rect (top-left + size) in the target.
   struct OverlayPush { int32_t ox, oy, w, h; };
 
-  image_allocation make_plane_image(vk::raii::Device &device, uint32_t w, uint32_t h, const char *name) {
+  // R8 planes for SDR; R16 unorm for HDR (10-bit content, 16-bit headroom).
+  image_allocation make_plane_image(vk::raii::Device &device, uint32_t w, uint32_t h, vk::Format format, const char *name) {
     vk::ImageCreateInfo info {
       .imageType = vk::ImageType::e2D,
-      .format = vk::Format::eR8Unorm,
+      .format = format,
       .extent = {.width = w, .height = h, .depth = 1},
       .mipLevels = 1,
       .arrayLayers = 1,
@@ -46,11 +47,11 @@ namespace {
     return image_allocation(device, info, {.usage = VMA_MEMORY_USAGE_AUTO}, name);
   }
 
-  vk::raii::ImageView make_plane_view(vk::raii::Device &device, vk::Image img) {
+  vk::raii::ImageView make_plane_view(vk::raii::Device &device, vk::Image img, vk::Format format) {
     return device.createImageView(vk::ImageViewCreateInfo {
       .image = img,
       .viewType = vk::ImageViewType::e2D,
-      .format = vk::Format::eR8Unorm,
+      .format = format,
       .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1, .layerCount = 1},
     });
   }
@@ -84,7 +85,8 @@ bool PyroWaveVideoDecoder::initialize(PDECODER_PARAMETERS params) {
     m_Width = params->width;
     m_Height = params->height;
     m_VideoFormat = params->videoFormat;
-    m_Chroma444 = params->videoFormat == VIDEO_FORMAT_PYROWAVE_444;
+    m_Chroma444 = (params->videoFormat & (VIDEO_FORMAT_PYROWAVE_444 | VIDEO_FORMAT_PYROWAVE_HDR10_444)) != 0;
+    m_Hdr = (params->videoFormat & (VIDEO_FORMAT_PYROWAVE_HDR10 | VIDEO_FORMAT_PYROWAVE_HDR10_444)) != 0;
     m_Window = params->window;
 
     // Instance extensions SDL needs to present to this window (VK_KHR_surface +
@@ -96,11 +98,39 @@ bool PyroWaveVideoDecoder::initialize(PDECODER_PARAMETERS params) {
         instExts.resize(nExt);
         SDL_Vulkan_GetInstanceExtensions(m_Window, &nExt, instExts.data());
     }
+    // HDR10 surfaces are exposed through VK_EXT_swapchain_colorspace; the
+    // context filters it out if the loader doesn't offer it.
+    instExts.push_back("VK_EXT_swapchain_colorspace");
 
     m_Ctx = pyrowave_vk::context::create(nullptr, instExts, /*want_swapchain=*/true);
     if (!m_Ctx) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: Vulkan context unavailable");
         return false;
+    }
+
+    // HDR streams need an HDR10 (ST 2084) capable surface. Verify up front -
+    // including in test mode - so the HDR profile is rejected cleanly and the
+    // session can fall back to SDR PyroWave instead of failing at stream start.
+    if (m_Hdr) {
+        bool hdrSurface = false;
+        VkSurfaceKHR probeRaw = VK_NULL_HANDLE;
+        if (SDL_Vulkan_CreateSurface(m_Window, static_cast<VkInstance>(*m_Ctx->instance()), &probeRaw)) {
+            vk::raii::SurfaceKHR probeSurface(m_Ctx->instance(), probeRaw);
+            try {
+                for (auto &f : m_Ctx->physical_device().getSurfaceFormatsKHR(*probeSurface)) {
+                    if (f.colorSpace == vk::ColorSpaceKHR::eHdr10St2084EXT) {
+                        hdrSurface = true;
+                        break;
+                    }
+                }
+            } catch (const std::exception &e) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: HDR surface probe failed: %s", e.what());
+            }
+        }
+        if (!hdrSurface) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: no HDR10 (ST 2084) surface available; rejecting HDR profile");
+            return false;
+        }
     }
 
     try {
@@ -146,15 +176,16 @@ bool PyroWaveVideoDecoder::initialize(PDECODER_PARAMETERS params) {
 bool PyroWaveVideoDecoder::initVulkanResources() {
     try {
         auto &device = m_Ctx->device();
+        const vk::Format planeFormat = m_Hdr ? vk::Format::eR16Unorm : vk::Format::eR8Unorm;
         uint32_t cw = m_Chroma444 ? uint32_t(m_Width) : (uint32_t(m_Width) + 1) / 2;
         uint32_t ch = m_Chroma444 ? uint32_t(m_Height) : (uint32_t(m_Height) + 1) / 2;
 
-        m_ImgY = make_plane_image(device, m_Width, m_Height, "pyrowave dec Y");
-        m_ImgCb = make_plane_image(device, cw, ch, "pyrowave dec Cb");
-        m_ImgCr = make_plane_image(device, cw, ch, "pyrowave dec Cr");
-        m_ViewY = make_plane_view(device, m_ImgY);
-        m_ViewCb = make_plane_view(device, m_ImgCb);
-        m_ViewCr = make_plane_view(device, m_ImgCr);
+        m_ImgY = make_plane_image(device, m_Width, m_Height, planeFormat, "pyrowave dec Y");
+        m_ImgCb = make_plane_image(device, cw, ch, planeFormat, "pyrowave dec Cb");
+        m_ImgCr = make_plane_image(device, cw, ch, planeFormat, "pyrowave dec Cr");
+        m_ViewY = make_plane_view(device, m_ImgY, planeFormat);
+        m_ViewCb = make_plane_view(device, m_ImgCb, planeFormat);
+        m_ViewCr = make_plane_view(device, m_ImgCr, planeFormat);
 
         m_CmdPool = vk::raii::CommandPool(device, vk::CommandPoolCreateInfo {
             .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
@@ -210,9 +241,33 @@ bool PyroWaveVideoDecoder::createSwapchain() {
         auto formats = phys.getSurfaceFormatsKHR(*m_Surface);
         vk::ColorSpaceKHR colorspace = formats.empty() ? vk::ColorSpaceKHR::eSrgbNonlinear : formats[0].colorSpace;
         m_SwapFormat = formats.empty() ? vk::Format::eB8G8R8A8Unorm : formats[0].format;
-        for (auto &f : formats) {
-            if (f.format == vk::Format::eR8G8B8A8Unorm || f.format == vk::Format::eB8G8R8A8Unorm) {
-                m_SwapFormat = f.format; colorspace = f.colorSpace; break;
+        if (m_Hdr) {
+            // HDR10: a 10-bit (or FP16) surface with the ST 2084 colorspace.
+            // The decoded PQ-encoded BT.2020 values are presented as-is.
+            bool found = false;
+            for (auto &f : formats) {
+                if (f.colorSpace != vk::ColorSpaceKHR::eHdr10St2084EXT) {
+                    continue;
+                }
+                if (f.format == vk::Format::eA2B10G10R10UnormPack32 ||
+                    f.format == vk::Format::eA2R10G10B10UnormPack32 ||
+                    f.format == vk::Format::eR16G16B16A16Sfloat) {
+                    m_SwapFormat = f.format;
+                    colorspace = f.colorSpace;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: HDR10 surface format no longer available");
+                return false;
+            }
+        }
+        else {
+            for (auto &f : formats) {
+                if (f.format == vk::Format::eR8G8B8A8Unorm || f.format == vk::Format::eB8G8R8A8Unorm) {
+                    m_SwapFormat = f.format; colorspace = f.colorSpace; break;
+                }
             }
         }
         m_SwapExtent = (caps.currentExtent.width != 0xFFFFFFFFu)
@@ -223,7 +278,8 @@ bool PyroWaveVideoDecoder::createSwapchain() {
         // Direct present (yuv2rgba writes the swapchain image) is only safe when the
         // swapchain image is a storage image AND format R8G8B8A8 - the shader stores
         // rgba8 by component, so B8G8R8A8 would swap R/B (the blit path converts).
-        m_DirectPresent = (m_SwapFormat == vk::Format::eR8G8B8A8Unorm) &&
+        m_DirectPresent = !m_Hdr &&
+                          (m_SwapFormat == vk::Format::eR8G8B8A8Unorm) &&
                           (bool) (caps.supportedUsageFlags & vk::ImageUsageFlagBits::eStorage);
 
         auto pretransform = (caps.supportedTransforms & vk::SurfaceTransformFlagBitsKHR::eIdentity)
@@ -264,8 +320,8 @@ bool PyroWaveVideoDecoder::createSwapchain() {
                     .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1, .layerCount = 1}}));
             }
         }
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: swapchain %ux%u present_mode=%d direct_present=%d present_wait=%d",
-                    m_SwapExtent.width, m_SwapExtent.height, (int) presentMode, (int) m_DirectPresent, (int) m_UsePresentWait);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: swapchain %ux%u present_mode=%d direct_present=%d present_wait=%d hdr=%d",
+                    m_SwapExtent.width, m_SwapExtent.height, (int) presentMode, (int) m_DirectPresent, (int) m_UsePresentWait, (int) m_Hdr);
 
         // Present IDs are per swapchain; reset the wait state and (re)start the
         // wait thread (stopPresentWaitThread() leaves it joined).
@@ -305,15 +361,17 @@ bool PyroWaveVideoDecoder::initConvertPipeline() {
     try {
         auto &device = m_Ctx->device();
 
-        // Offscreen R8G8B8A8 compute target (blit path; matches the shader's rgba8).
+        // Offscreen compute target for the blit path: RGBA8 for SDR, FP16 for
+        // HDR (the blit converts to the 10-bit ST 2084 swapchain image).
+        const vk::Format rgbaFormat = m_Hdr ? vk::Format::eR16G16B16A16Sfloat : vk::Format::eR8G8B8A8Unorm;
         vk::ImageCreateInfo ri {
-            .imageType = vk::ImageType::e2D, .format = vk::Format::eR8G8B8A8Unorm,
+            .imageType = vk::ImageType::e2D, .format = rgbaFormat,
             .extent = {.width = (uint32_t) m_Width, .height = (uint32_t) m_Height, .depth = 1},
             .mipLevels = 1, .arrayLayers = 1,
             .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc};
         m_ImgRgba = image_allocation(device, ri, {.usage = VMA_MEMORY_USAGE_AUTO}, "pyrowave rgba");
         m_RgbaView = device.createImageView(vk::ImageViewCreateInfo {
-            .image = m_ImgRgba, .viewType = vk::ImageViewType::e2D, .format = vk::Format::eR8G8B8A8Unorm,
+            .image = m_ImgRgba, .viewType = vk::ImageViewType::e2D, .format = rgbaFormat,
             .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1, .layerCount = 1}});
 
         m_Sampler = vk::raii::Sampler(device, vk::SamplerCreateInfo {
@@ -727,7 +785,7 @@ bool PyroWaveVideoDecoder::decodeAndPresent() {
         const bool scaling = m_SwapExtent.width != uint32_t(m_Width) || m_SwapExtent.height != uint32_t(m_Height);
         ConvPush push {(int32_t) m_SwapExtent.width, (int32_t) m_SwapExtent.height,
                        1.0f / float(m_SwapExtent.width), 1.0f / float(m_SwapExtent.height),
-                       m_Width, m_Height, scaling ? 1 : 0};
+                       m_Width, m_Height, scaling ? 1 : 0, m_Hdr ? 1 : 0};
         m_Cmd.pushConstants<ConvPush>(*m_Pl, vk::ShaderStageFlagBits::eCompute, 0, push);
         m_Cmd.dispatch((m_SwapExtent.width + 7) / 8, (m_SwapExtent.height + 7) / 8, 1);
 
@@ -760,7 +818,7 @@ bool PyroWaveVideoDecoder::decodeAndPresent() {
         m_Cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *m_Pipe);
         m_Cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *m_Pl, 0, *m_Dset, {});
         ConvPush push {m_Width, m_Height, 1.0f / float(m_Width), 1.0f / float(m_Height),
-                       m_Width, m_Height, 0};
+                       m_Width, m_Height, 0, m_Hdr ? 1 : 0};
         m_Cmd.pushConstants<ConvPush>(*m_Pl, vk::ShaderStageFlagBits::eCompute, 0, push);
         m_Cmd.dispatch((uint32_t(m_Width) + 7) / 8, (uint32_t(m_Height) + 7) / 8, 1);
 

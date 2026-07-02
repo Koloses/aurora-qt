@@ -66,9 +66,25 @@ namespace pyrowave_vk {
       vk::InstanceCreateInfo inst_info {.pApplicationInfo = &app_info};
       // Surface extensions (e.g. VK_KHR_surface + the platform one) requested by
       // the caller so a window swapchain can be created for presentation.
+      // Filter against what the loader actually offers: some requests are
+      // optional (e.g. VK_EXT_swapchain_colorspace for HDR10 surfaces) and
+      // enabling an unsupported extension fails instance creation entirely.
+      std::vector<const char *> filtered_exts;
       if (!instance_exts.empty()) {
-        inst_info.enabledExtensionCount = (uint32_t) instance_exts.size();
-        inst_info.ppEnabledExtensionNames = instance_exts.data();
+        auto avail_inst = self->ctx.enumerateInstanceExtensionProperties();
+        for (auto *want : instance_exts) {
+          bool found = false;
+          for (auto &e : avail_inst) {
+            if (std::strcmp(e.extensionName, want) == 0) { found = true; break; }
+          }
+          if (found) {
+            filtered_exts.push_back(want);
+          } else {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "pyrowave: instance extension %s unavailable; continuing without it", want);
+          }
+        }
+        inst_info.enabledExtensionCount = (uint32_t) filtered_exts.size();
+        inst_info.ppEnabledExtensionNames = filtered_exts.data();
       }
       self->inst = vk::raii::Instance(self->ctx, inst_info);
 
@@ -169,6 +185,10 @@ namespace pyrowave_vk {
 
       vk::PhysicalDeviceFeatures base_features {};
       base_features.shaderStorageImageWriteWithoutFormat = true;
+      // Format-less READS too: the overlay blend reads the output image, which
+      // is RGBA8 for SDR and RGBA16F for HDR. Universally supported on the
+      // desktop GPUs this decoder targets.
+      base_features.shaderStorageImageReadWithoutFormat = true;
       base_features.shaderInt16 = supported.get<vk::PhysicalDeviceFeatures2>().features.shaderInt16;
 
       vk::StructureChain<

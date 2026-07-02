@@ -775,6 +775,14 @@ bool Session::initialize(QQuickWindow* qtWindow)
         // below with the rest of VIDEO_FORMAT_MASK_YUV444 if the pref is off.
         m_SupportedVideoFormats.prepend(VIDEO_FORMAT_PYROWAVE_444);
     }
+    if (m_Preferences->enableHdr) {
+        // 10-bit HDR10 profiles (stripped below with VIDEO_FORMAT_MASK_10BIT
+        // when HDR is off). Prepended last = highest negotiation priority.
+        m_SupportedVideoFormats.prepend(VIDEO_FORMAT_PYROWAVE_HDR10);
+        if (m_Preferences->enableYUV444) {
+            m_SupportedVideoFormats.prepend(VIDEO_FORMAT_PYROWAVE_HDR10_444);
+        }
+    }
     if (getDecoderAvailability(testWindow,
                                m_Preferences->videoDecoderSelection,
                                VIDEO_FORMAT_PYROWAVE,
@@ -783,6 +791,17 @@ bool Session::initialize(QQuickWindow* qtWindow)
                                m_StreamConfig.fps) == DecoderAvailability::None) {
         m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_PYROWAVE);
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "PyroWave decoder unavailable; not advertising it");
+    }
+    else if (m_Preferences->enableHdr &&
+             getDecoderAvailability(testWindow,
+                                    m_Preferences->videoDecoderSelection,
+                                    VIDEO_FORMAT_PYROWAVE_HDR10,
+                                    m_StreamConfig.width,
+                                    m_StreamConfig.height,
+                                    m_StreamConfig.fps) == DecoderAvailability::None) {
+        // Decoder works but the display has no HDR10 (ST 2084) surface.
+        m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_PYROWAVE_HDR10 | VIDEO_FORMAT_PYROWAVE_HDR10_444);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "PyroWave HDR unavailable (no HDR10 surface); advertising SDR PyroWave only");
     }
 #endif
 
