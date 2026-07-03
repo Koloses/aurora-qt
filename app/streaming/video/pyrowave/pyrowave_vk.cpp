@@ -4,8 +4,6 @@
  *
  * Mirrors Sunshine's src/pyrowave/pyrowave_vk.cpp but logs via SDL. Creates a
  * headless Vulkan device + the VMA vk_allocator singleton the codec requires.
- * NOT yet compiled (no Vulkan SDK in the authoring environment); validate on a
- * real host with `qmake CONFIG+=pyrowave`. TODO markers note spots to revisit.
  */
 #include "pyrowave_vk.h"
 
@@ -245,8 +243,8 @@ namespace pyrowave_vk {
       self->dev = vk::raii::Device(self->phys_dev, dev_chain.get<vk::DeviceCreateInfo>());
       self->compute_queue = vk::raii::Queue(self->dev, cqf, 0);
 
-      // TODO(pyrowave): VMA needs explicit function pointers under the dynamic
-      // dispatcher; verify these are correct on the target.
+      // VMA needs explicit function pointers under vulkan_raii's dynamic
+      // dispatcher; it resolves the rest from these two entry points.
       VmaVulkanFunctions vma_fns {};
       vma_fns.vkGetInstanceProcAddr = self->ctx.getDispatcher()->vkGetInstanceProcAddr;
       vma_fns.vkGetDeviceProcAddr = self->dev.getDispatcher()->vkGetDeviceProcAddr;
