@@ -1016,6 +1016,21 @@ int PyroWaveVideoDecoder::submitDecodeUnit(PDECODE_UNIT du) {
     // NB: no clear() here - the GPU may still be reading the input buffers;
     // the next submit clears them after waitPreviousFrame().
 
+    // Keep-previous frames arriving before any full (code-0) frame: the
+    // stream's initial full frame was lost (routine at session start), so the
+    // picture is degraded until the host sends another one. Keep requesting an
+    // IDR (the host answers with a full frame) until the state initializes.
+    if (ok && m_Input->awaiting_state_init()) {
+        uint64_t nowUs = LiGetMicroseconds();
+        if (nowUs - m_LastAnomalyLogUs > 1000000) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "pyrowave: no full frame received yet (initial frame lost); requesting IDR");
+            m_LastAnomalyLogUs = nowUs;
+        }
+        updateStatsAndOverlay(du, decodeTimeUs, ok);
+        return DR_NEED_IDR;
+    }
+
     // Phase-lock feedback: forward the latest scanout-margin error measured by
     // the present-wait thread. Sent from this thread because the control
     // stream is not safe to use from arbitrary threads.
