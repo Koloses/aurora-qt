@@ -87,7 +87,11 @@ bool PyroWaveVideoDecoder::initialize(PDECODER_PARAMETERS params) {
     m_VideoFormat = params->videoFormat;
     m_Chroma444 = (params->videoFormat & (VIDEO_FORMAT_PYROWAVE_444 | VIDEO_FORMAT_PYROWAVE_HDR10_444)) != 0;
     m_Hdr = (params->videoFormat & (VIDEO_FORMAT_PYROWAVE_HDR10 | VIDEO_FORMAT_PYROWAVE_HDR10_444)) != 0;
+    m_SyncPresent = SDL_getenv("PYROWAVE_SYNC_PRESENT") != nullptr;
     m_Window = params->window;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "pyrowave: profile format=0x%x chroma444=%d hdr=%d sync_present=%d",
+                params->videoFormat, (int) m_Chroma444, (int) m_Hdr, (int) m_SyncPresent);
 
     // Instance extensions SDL needs to present to this window (VK_KHR_surface +
     // the platform surface extension). Required so context::create() builds an
@@ -893,6 +897,12 @@ bool PyroWaveVideoDecoder::decodeAndPresent() {
     // next frame (mirrors the Android decoder).
     m_HavePending = true;
     m_Parity ^= 1;
+
+    // PYROWAVE_SYNC_PRESENT=1: wait right here instead (the pre-pipelining
+    // behaviour). Diagnostic kill switch to isolate pipelining as a suspect.
+    if (m_SyncPresent) {
+        waitPreviousFrame();
+    }
     return true;
 }
 
@@ -985,6 +995,20 @@ int PyroWaveVideoDecoder::submitDecodeUnit(PDECODE_UNIT du) {
     // Make the CPU-written bitstream/offset buffers visible to the GPU before decode
     // (non-coherent HOST_CACHED memory needs an explicit flush; no-op on coherent).
     m_Input->flush();
+
+    // Surface bitstream parse anomalies in the log (their std::cerr output is
+    // not captured by the log file). Throttled to once per second.
+    uint32_t anomalies = m_Input->parse_anomalies();
+    if (anomalies != m_LastParseAnomalies) {
+        uint64_t nowUs = LiGetMicroseconds();
+        if (nowUs - m_LastAnomalyLogUs > 1000000) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "pyrowave: bitstream parse anomalies: +%u (total %u) at frame %d",
+                        anomalies - m_LastParseAnomalies, anomalies, du->frameNumber);
+            m_LastAnomalyLogUs = nowUs;
+        }
+        m_LastParseAnomalies = anomalies;
+    }
 
     uint64_t decodeStartUs = LiGetMicroseconds();
     bool ok = decodeAndPresent();

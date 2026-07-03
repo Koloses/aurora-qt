@@ -114,6 +114,9 @@ private:
     bool m_SwapchainStale = false;  // out-of-date/suboptimal seen; recreate before next frame
     bool m_Chroma444 = false;       // stream uses the PyroWave 4:4:4 profile
     bool m_Hdr = false;             // stream uses a PyroWave HDR10 profile (10-bit BT.2020 + PQ)
+    bool m_SyncPresent = false;     // PYROWAVE_SYNC_PRESENT=1: disable pipelining (bisect aid)
+    uint32_t m_LastParseAnomalies = 0;
+    uint64_t m_LastAnomalyLogUs = 0;
 
     bool createSwapchain();     // (re)creates the swapchain for the existing surface
     bool recreateSwapchain();   // teardown + createSwapchain, called on resize/out-of-date
