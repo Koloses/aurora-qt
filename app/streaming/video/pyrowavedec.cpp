@@ -1016,19 +1016,21 @@ int PyroWaveVideoDecoder::submitDecodeUnit(PDECODE_UNIT du) {
     // NB: no clear() here - the GPU may still be reading the input buffers;
     // the next submit clears them after waitPreviousFrame().
 
-    // Keep-previous frames arriving before any full (code-0) frame: the
-    // stream's initial full frame was lost (routine at session start), so the
-    // picture is degraded until the host sends another one. Keep requesting an
-    // IDR (the host answers with a full frame) until the state initializes.
+    // No full (code-0) frame seen yet (the stream's first frames are
+    // routinely lost). The picture now converges on its own - the wavelet
+    // state is cleared at init and fills in via the rolling refresh - but a
+    // full frame gets there faster, so nudge the host once a second.
+    // NEVER gate or drop frames for this: returning DR_NEED_IDR makes
+    // moonlight discard every frame until an IDR arrives, which deadlocks
+    // against hosts that answer refresh requests with keep frames.
     if (ok && m_Input->awaiting_state_init()) {
         uint64_t nowUs = LiGetMicroseconds();
         if (nowUs - m_LastAnomalyLogUs > 1000000) {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "pyrowave: no full frame received yet (initial frame lost); requesting IDR");
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "pyrowave: no full frame seen yet; converging via refresh (nudging host)");
+            LiRequestIdrFrame();
             m_LastAnomalyLogUs = nowUs;
         }
-        updateStatsAndOverlay(du, decodeTimeUs, ok);
-        return DR_NEED_IDR;
     }
 
     // Phase-lock feedback: forward the latest scanout-margin error measured by
