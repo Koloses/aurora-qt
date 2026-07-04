@@ -8,10 +8,10 @@ CONFIG += c++17
 CONFIG += pyrowave
 
 unix:!macx {
-    TARGET = moonlight
+    TARGET = aurora
 } else {
     # On macOS, this is the name displayed in the global menu bar
-    TARGET = Moonlight
+    TARGET = Aurora
 }
 
 include(../globaldefs.pri)
@@ -593,7 +593,7 @@ unix:!macx: {
     desktop.files = deploy/linux/com.moonlight_stream.Moonlight.desktop
     desktop.path = $$PREFIX/$$DATADIR/applications/
 
-    icons.files = res/moonlight.svg
+    icons.files = res/aurora.svg
     icons.path = $$PREFIX/$$DATADIR/icons/hicolor/scalable/apps/
 
     appstream.files = deploy/linux/com.moonlight_stream.Moonlight.appdata.xml
