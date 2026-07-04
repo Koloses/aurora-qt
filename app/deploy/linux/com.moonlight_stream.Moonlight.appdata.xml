@@ -3,11 +3,11 @@
 	<id>com.moonlight_stream.Moonlight</id>
 	<metadata_license>CC0-1.0</metadata_license>
 	<project_license>GPL-3.0+</project_license>
-	<name>Moonlight</name>
-	<summary>Stream games and other applications from another PC running Sunshine or GeForce Experience</summary>
+	<name>Aurora</name>
+	<summary>Stream games and other applications from another PC running Solarflare, Sunshine, or GeForce Experience</summary>
 
 	<description>
-		<p>Moonlight can stream games and other applications from another PC with Sunshine or GeForce Experience software installed.</p>
+		<p>Aurora can stream games and other applications from another PC with Solarflare, Sunshine, or GeForce Experience software installed. It adds support for the PyroWave ultra-low-latency codec when paired with a Solarflare host.</p>
 		<p>Features include:</p>
 		<ul>
 			<li>Hardware accelerated video decoding with VAAPI, VDPAU, and Vulkan Video support</li>
