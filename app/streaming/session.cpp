@@ -38,7 +38,6 @@
 #include <QtEndian>
 #include <QCoreApplication>
 #include <QThreadPool>
-#include <QSvgRenderer>
 #include <QPainter>
 #include <QImage>
 #include <QGuiApplication>
@@ -1951,12 +1950,15 @@ void Session::exec()
 
     m_InputHandler->setWindow(m_Window);
 
-    QSvgRenderer svgIconRenderer(QString(":/res/moonlight.svg"));
+    QImage srcIconImage(QString(":/res/aurora.png"));
     QImage svgImage(ICON_SIZE, ICON_SIZE, QImage::Format_RGBA8888);
     svgImage.fill(0);
 
-    QPainter svgPainter(&svgImage);
-    svgIconRenderer.render(&svgPainter);
+    {
+        QPainter iconPainter(&svgImage);
+        iconPainter.setRenderHint(QPainter::SmoothPixmapTransform);
+        iconPainter.drawImage(QRect(0, 0, ICON_SIZE, ICON_SIZE), srcIconImage);
+    }
     SDL_Surface* iconSurface = SDL_CreateRGBSurfaceWithFormatFrom((void*)svgImage.constBits(),
                                                                   svgImage.width(),
                                                                   svgImage.height(),
