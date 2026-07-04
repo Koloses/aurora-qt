@@ -29,6 +29,10 @@ AutoUpdateChecker::AutoUpdateChecker(QObject *parent) :
 
 void AutoUpdateChecker::start()
 {
+    // Update checks disabled for this fork: moonlight-stream.org's update feed
+    // describes upstream Moonlight builds, not this one.
+    return;
+
     if (!m_Nam) {
         Q_ASSERT(m_Nam);
         return;
